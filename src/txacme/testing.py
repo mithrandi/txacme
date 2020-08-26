@@ -89,7 +89,7 @@ class FakeClient(object):
     Provides the same API as `~txacme.client.Client`, but performs no network
     operations and issues certificates signed by its own fake CA.
     """
-    _challenge_types = [challenges.TLSSNI01]
+    _challenge_types = [challenges.HTTP01]
 
     def __init__(self, key, clock, ca_key=None, controller=None):
         self.key = key
@@ -149,14 +149,12 @@ class FakeClient(object):
         # Nothing to stop as reactor is not spun.
         return succeed(None)
 
-    def register(self, new_reg=None):
+    def start(self, email=None):
         self._registered = True
-        if new_reg is None:
-            new_reg = messages.NewRegistration()
+        body = messages.Registration.from_data(email=email, terms_of_service_agreed=True)
         self.regr = messages.RegistrationResource(
-            body=messages.Registration(
-                contact=new_reg.contact,
-                agreement=new_reg.agreement))
+            body=body
+        )
         return succeed(self.regr)
 
     def agree_to_tos(self, regr):
@@ -166,24 +164,38 @@ class FakeClient(object):
                 agreement=regr.terms_of_service))
         return succeed(self.regr)
 
-    def request_challenges(self, identifier):
-        self._authorizations[identifier] = challenges = OrderedDict()
-        for chall_type in self._challenge_types:
-            uuid = unicode(uuid4())
-            challb = messages.ChallengeBody(
-                chall=chall_type(token=b'token'),
-                uri=uuid,
-                status=messages.STATUS_PENDING)
-            challenges[chall_type] = uuid
-            self._challenges[uuid] = challb
+    def submit_order(self, key, names):
+        self._key = key
+        identifiers = [
+            messages.Identifier(typ=messages.IDENTIFIER_FQDN, value=name)
+            for name in names
+        ]
+        for identifier in identifiers:
+            self._authorizations[identifier] = challenges = OrderedDict()
+            for chall_type in self._challenge_types:
+                uuid = unicode(uuid4())
+                challb = messages.ChallengeBody(
+                    chall=chall_type(token=b'token'),
+                    uri=uuid,
+                    status=messages.STATUS_PENDING
+                )
+                challenges[chall_type] = uuid
+                self._challenges[uuid] = challb
         return succeed(
-            messages.AuthorizationResource(
-                body=messages.Authorization(
-                    identifier=identifier,
-                    status=messages.STATUS_PENDING,
-                    challenges=[
-                        self._challenges[u] for u in challenges.values()],
-                    combinations=[[n] for n in range(len(challenges))])))
+            messages.Order(
+                identifiers=identifiers,
+                authorizations=[
+                    messages.AuthorizationResource(
+                        body=messages.Authorization(
+                            identifier=identifier,
+                            status=messages.STATUS_PENDING,
+                            challenges=[self._challenges[u] for u in challenges.values()],
+                            combinations=[[n] for n in range(len(challenges))]
+                        )
+                    )
+                ]
+            )
+        )
 
     def answer_challenge(self, challenge_body, response):
         challb = self._challenges[challenge_body.uri]
@@ -191,7 +203,7 @@ class FakeClient(object):
         self._challenges[challenge_body.uri] = challb
         return succeed(challb)
 
-    def poll(self, authzr):
+    def check_authorization(self, authzr):
         challenges = [
             self._challenges[u] for u
             in self._authorizations[authzr.body.identifier].values()]
@@ -200,31 +212,30 @@ class FakeClient(object):
             if any(c.status == messages.STATUS_VALID for c in challenges)
             else messages.STATUS_PENDING)
         return succeed(
-            (messages.AuthorizationResource(
+            messages.AuthorizationResource(
                 body=messages.Authorization(
                     status=status,
                     challenges=challenges,
                     combinations=[[n] for n in range(len(challenges))])),
-             1.0))
+        )
 
-    def request_issuance(self, csr):
-        csr = csr.csr
-        # TODO: Only in Cryptography 1.3
-        # assert csr.is_signature_valid
+    def finalize(self, order):
+        dns_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, order.identifiers[0].value)])
+        pub_key = self._key.public_key()
         cert = (
             x509.CertificateBuilder()
-            .subject_name(csr.subject)
+            .subject_name(dns_name)
             .issuer_name(self._ca_name)
             .not_valid_before(self._now() - timedelta(seconds=3600))
             .not_valid_after(self._now() + timedelta(days=90))
             .serial_number(int(uuid4()))
-            .public_key(csr.public_key())
+            .public_key(pub_key)
+            # .add_extension(
+            #     csr.extensions.get_extension_for_oid(
+            #         ExtensionOID.SUBJECT_ALTERNATIVE_NAME).value,
+            #     critical=False)
             .add_extension(
-                csr.extensions.get_extension_for_oid(
-                    ExtensionOID.SUBJECT_ALTERNATIVE_NAME).value,
-                critical=False)
-            .add_extension(
-                x509.SubjectKeyIdentifier.from_public_key(csr.public_key()),
+                x509.SubjectKeyIdentifier.from_public_key(pub_key),
                 critical=False)
             .add_extension(self._ca_aki, critical=False)
             .sign(
@@ -233,7 +244,14 @@ class FakeClient(object):
                 backend=default_backend()))
         cert_res = messages.CertificateResource(
             body=cert.public_bytes(encoding=serialization.Encoding.DER))
-        return self._controller.issue().addCallback(lambda _: cert_res)
+        return succeed(messages.OrderResource(
+                uri="https://example.com/what",
+                body=order,
+            ))
+        return (
+            self._controller.issue()
+            .addCallback(lambda _: cert_res)
+        )
 
     def fetch_chain(self, certr, max_length=10):
         return succeed([
